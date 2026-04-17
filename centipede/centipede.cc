@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -53,6 +54,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -109,6 +111,38 @@ std::vector<MutantRef> InputsToMutantRefs(const std::vector<ByteSpan>& inputs) {
     mutants.push_back(MutantRef{input, Mutant::kOriginNone});
   }
   return mutants;
+}
+
+// SIGUSR1 handler state: the signal handler only flips an atomic flag, and the
+// shard-0 fuzzing loop observes the flag between batches and performs the
+// (non-async-signal-safe) telemetry dump itself.
+std::atomic<bool> g_snapshot_requested{false};
+
+extern "C" void SnapshotSignalHandler(int /*signum*/) {
+  g_snapshot_requested.store(true, std::memory_order_relaxed);
+}
+
+void InstallSnapshotSignalHandlerOnce() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    struct sigaction sa = {};
+    sa.sa_handler = &SnapshotSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR1, &sa, nullptr) != 0) {
+      FUZZTEST_LOG(ERROR) << "Failed to install SIGUSR1 handler";
+    } else {
+      FUZZTEST_LOG(INFO)
+          << "SIGUSR1 handler installed: send to this process to dump a "
+             "telemetry snapshot without stopping the fuzzer";
+    }
+  });
+}
+
+std::string SnapshotAnnotation() {
+  return absl::StrCat(
+      "snapshot_",
+      absl::FormatTime("%Y%m%d_%H%M%S", absl::Now(), absl::LocalTimeZone()));
 }
 
 }  // namespace
@@ -843,6 +877,13 @@ void Centipede::FuzzingLoop() {
                      << " "
                      << "seed: " << env_.seed << "\n\n\n";
 
+  // Install the SIGUSR1 handler on the shard that owns corpus telemetry. The
+  // signal disposition is process-wide, so installing once from any thread is
+  // enough; only this shard will act on the flag.
+  if (env_.DumpCorpusTelemetryInThisShard()) {
+    InstallSnapshotSignalHandlerOnce();
+  }
+
   if (env_.load_shards_only) {
     UpdateAndMaybeLogStats("begin-load-shard", 0);
   } else {
@@ -944,6 +985,15 @@ void Centipede::FuzzingLoop() {
 
     // Dump the intermediate telemetry files.
     MaybeGenerateTelemetryAfterBatch("latest", batch_index);
+
+    // Handle on-demand SIGUSR1 snapshots. Only the shard that owns corpus
+    // telemetry acts on the flag so it is cleared exactly once per signal.
+    if (env_.DumpCorpusTelemetryInThisShard() &&
+        g_snapshot_requested.exchange(false, std::memory_order_relaxed)) {
+      const std::string annotation = SnapshotAnnotation();
+      MaybeGenerateTelemetry(annotation,
+                             absl::StrCat("SIGUSR1 snapshot ", annotation));
+    }
 
     if (env_.load_other_shard_frequency != 0 && batch_index != 0 &&
         (batch_index % env_.load_other_shard_frequency) == 0 &&
